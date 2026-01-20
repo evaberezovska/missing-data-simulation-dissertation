@@ -1,0 +1,473 @@
+---
+title: "KNN"
+author: '230031900'
+date: "2025-07-15"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# load libraries
+library(VIM)        
+library(caret)      
+library(ggplot2)    
+library(Metrics)    
+
+set.seed(57)        
+```
+
+
+
+```{r data}
+# create directories for diagnostics
+diagnostics_dir <- "results/knn_diagnostics"
+plots_dir <- file.path(diagnostics_dir, "plots")
+dir.create(diagnostics_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+iteration_dir <- "data/amputed/iteration_1"
+complete_dir <- "data/complete/iteration_1"
+
+train_complete <- read.csv(file.path(complete_dir, "train_complete.csv"))
+test_complete <- read.csv(file.path(complete_dir, "test_complete.csv"))
+train_low_missing <- read.csv(file.path(iteration_dir, "train_low.csv"))
+test_low_missing <- read.csv(file.path(iteration_dir, "test_low.csv"))
+train_high_missing <- read.csv(file.path(iteration_dir, "train_high.csv"))
+test_high_missing <- read.csv(file.path(iteration_dir, "test_high.csv"))
+
+features <- setdiff(names(train_low_missing), "target")
+
+cat("Loaded data from iteration 1 for KNN parameter selection diagnostics\n")
+
+# convert binary columns to factors 
+prepare_data_for_knn <- function(data_df) {
+  binary_cols <- sapply(data_df, function(x) {
+    all(x %in% c(0, 1, NA), na.rm = TRUE)
+  })
+  
+  for (col in names(data_df)[binary_cols]) {
+    if (col != "target") {  
+      data_df[[col]] <- factor(data_df[[col]], levels = c(0, 1))
+    }
+  }
+  
+  return(data_df)
+}
+
+train_low_missing <- prepare_data_for_knn(train_low_missing)
+test_low_missing <- prepare_data_for_knn(test_low_missing)
+train_high_missing <- prepare_data_for_knn(train_high_missing)
+test_high_missing <- prepare_data_for_knn(test_high_missing)
+
+```
+
+
+
+
+
+```{r tuning, echo=FALSE}
+
+# tune knn
+tune_kNN <- function(train_df, complete_df, features, k_vals) {
+  
+  set.seed(57) 
+  
+  idx_val   <- createDataPartition(train_df$target, p=0.20, list=FALSE)
+  train_sub <- train_df[-idx_val, ]
+  valid_sub <- train_df[ idx_val, ]
+  truth_sub <- complete_df[ rownames(valid_sub), features ]
+  mask_valid<- is.na(valid_sub[, features])
+  results   <- data.frame(k=k_vals, rmse=NA, mae=NA)
+  
+  missing_features <- features[sapply(valid_sub[,features], function(x) any(is.na(x)))]
+  
+  for(i in seq_along(k_vals)) {
+    k0 <- k_vals[i]
+    combined <- rbind(train_sub[,features], valid_sub[,features])
+    
+    set.seed(57) 
+    
+    imp_comb <- kNN(
+      data       = combined,
+      variable   = missing_features,
+      metric     = "gower", 
+      k          = k0,
+      numFun     = mean,
+      catFun    = maxCat,
+      impNA = TRUE,
+      methodStand = "range",
+      imp_var    = FALSE,
+      trace      = FALSE
+    )
+    
+    n_train   <- nrow(train_sub)
+    imp_valid <- imp_comb[(n_train+1):nrow(imp_comb), features]
+    
+
+    missing_idx <- which(mask_valid)
+    preds <- numeric(length(missing_idx))
+    truths <- numeric(length(missing_idx))
+    
+
+    counter <- 1
+    for(row in 1:nrow(valid_sub)) {
+      for(col in 1:length(features)) {
+        if(is.na(valid_sub[row, features[col]])) {
+          if(is.factor(imp_valid[[features[col]]])) {
+            preds[counter] <- as.numeric(as.character(imp_valid[row, features[col]]))
+          } else {
+            preds[counter] <- imp_valid[row, features[col]]
+          }
+          
+          if(is.factor(truth_sub[[features[col]]])) {
+            truths[counter] <- as.numeric(as.character(truth_sub[row, features[col]]))
+          } else {
+            truths[counter] <- truth_sub[row, features[col]]
+          }
+          
+          counter <- counter + 1
+        }
+      }
+    }
+    
+
+    results$rmse[i] <- rmse(truths, preds)
+    results$mae[i]  <- mae(truths, preds)
+    
+    cat("k =", k0, "-> RMSE:", round(results$rmse[i], 4), ", MAE:", round(results$mae[i], 4), "\n")
+  }
+  results
+}
+
+```
+
+
+
+```{r choose_k low}
+
+# find best k 
+k_candidates_low <- c(5,10,15,20,25,30,45,50,55,60,65,70)
+results_low <- tune_kNN(train_low_missing, train_complete, features, k_candidates_low)
+
+# find optimal
+find_optimal_k <- function(k_vals, rmse_vals, threshold = 0.01, min_k = 25) {
+  for (i in 2:length(k_vals)) {
+    if (k_vals[i-1] < min_k) {
+      next
+    }
+    
+    improvement <- (rmse_vals[i-1] - rmse_vals[i]) / rmse_vals[i-1]
+    
+    if (improvement < threshold) {
+      return(k_vals[i-1])
+    }
+  }
+  
+  valid_indices <- which(k_vals >= min_k)
+  if (length(valid_indices) > 0) {
+    return(k_vals[valid_indices[which.min(rmse_vals[valid_indices])]])
+  } else {
+    return(k_vals[which.min(rmse_vals)])
+  }
+}
+
+best_k_low <- find_optimal_k(results_low$k, results_low$rmse, min_k = 25)
+cat("Best k for low missing:", best_k_low, "\n")
+```
+
+
+
+```{r elbow_plot}
+# create elbow plot for low missing data
+p_low <- ggplot(results_low, aes(x = k, y = rmse)) +
+  geom_line() + geom_point() +
+  labs(title = "Validation RMSE vs k — Low Missing",
+       x = "k (n_neighbors)", y = "Validation RMSE") +
+  theme_minimal() +
+  geom_vline(xintercept = best_k_low, linetype = "dashed", color = "red")
+
+# save
+ggsave(file.path(plots_dir, "low_elbow_plot.jpg"), p_low, width = 10, height = 8, dpi = 300)
+cat("Saved low missing elbow plot to", file.path(plots_dir, "low_elbow_plot.jpg"), "\n")
+
+print(p_low)
+
+```
+
+
+
+
+```{r train_low}
+
+missing_features_train_low <- features[sapply(train_low_missing[,features], function(x) any(is.na(x)))]
+
+set.seed(57) 
+
+imp_train_low <- kNN(
+      data       = train_low_missing,        
+      variable   = missing_features_train_low,    
+      metric     = "gower", 
+      k          = best_k_low,               
+      numFun     = mean,
+      catFun     = maxCat,
+      impNA      = TRUE,
+      methodStand = "range",
+      imp_var    = FALSE,
+      trace      = FALSE
+    )
+
+# evaluate training performance 
+mask_train_low <- is.na(train_low_missing[,features])
+
+# store predictions and truth values
+pred_values_low <- c()
+truth_values_low <- c()
+
+for(row in 1:nrow(train_low_missing)) {
+  for(col in 1:length(features)) {
+    if(is.na(train_low_missing[row, features[col]])) {
+      pred_val <- if(is.factor(imp_train_low[[features[col]]])) {
+        as.numeric(as.character(imp_train_low[row, features[col]]))
+      } else {
+        as.numeric(imp_train_low[row, features[col]])
+      }
+      
+      truth_val <- if(is.factor(train_complete[[features[col]]])) {
+        as.numeric(as.character(train_complete[row, features[col]]))
+      } else {
+        as.numeric(train_complete[row, features[col]])
+      }
+      
+      pred_values_low <- c(pred_values_low, pred_val)
+      truth_values_low <- c(truth_values_low, truth_val)
+    }
+  }
+}
+
+train_rmse_low <- rmse(truth_values_low, pred_values_low)
+train_mae_low <- mae(truth_values_low, pred_values_low)
+
+cat("Low train RMSE =", round(train_rmse_low,4), ", MAE =", round(train_mae_low,4), "\n")
+```
+
+
+
+```{r test low}
+
+missing_features_test_low <- features[sapply(test_low_missing[,features], function(x) any(is.na(x)))]
+
+set.seed(57)  
+
+combined_test_low <- rbind(train_low_missing[,features], test_low_missing[,features])
+imp_test_comb_low <- kNN(
+  data        = combined_test_low,              
+  variable    = missing_features_test_low,      
+  metric      = "gower", 
+  k           = best_k_low,                 
+  numFun      = mean,
+  catFun      = maxCat,
+  impNA       = TRUE,
+  methodStand = "range",
+  imp_var     = FALSE,
+  trace       = FALSE
+)
+
+n_train_low <- nrow(train_low_missing)
+imp_test_low <- imp_test_comb_low[(n_train_low+1):nrow(imp_test_comb_low), ]
+imp_test_low$target <- test_low_missing$target
+
+mask_test_low <- is.na(test_low_missing[,features])
+
+pred_values_test_low <- c()
+truth_values_test_low <- c()
+
+for(row in 1:nrow(test_low_missing)) {
+  for(col in 1:length(features)) {
+    if(is.na(test_low_missing[row, features[col]])) {
+      pred_val <- if(is.factor(imp_test_low[[features[col]]])) {
+        as.numeric(as.character(imp_test_low[row, features[col]]))
+      } else {
+        as.numeric(imp_test_low[row, features[col]])
+      }
+      
+      truth_val <- if(is.factor(test_complete[[features[col]]])) {
+        as.numeric(as.character(test_complete[row, features[col]]))
+      } else {
+        as.numeric(test_complete[row, features[col]])
+      }
+      
+      pred_values_test_low <- c(pred_values_test_low, pred_val)
+      truth_values_test_low <- c(truth_values_test_low, truth_val)
+    }
+  }
+}
+
+test_rmse_low <- rmse(truth_values_test_low, pred_values_test_low)
+test_mae_low <- mae(truth_values_test_low, pred_values_test_low)
+
+cat("Low test RMSE =", round(test_rmse_low,4), ", MAE =", round(test_mae_low,4), "\n")
+
+```
+
+
+
+```{r tuning high}
+
+# find best k 
+k_candidates_high <- c(5,10,15,20,25,30,45,50,55,60,65,70)
+results_high <- tune_kNN(train_high_missing, train_complete, features, k_candidates_high)
+
+best_k_high <- find_optimal_k(results_high$k, results_high$rmse, min_k = 25)
+cat("Best k for high missing:", best_k_high, "\n")
+
+```
+
+
+
+
+
+```{r elbow_high}
+# create elbow plot for high missing data
+p_high <- ggplot(results_high, aes(x = k, y = rmse)) +
+  geom_line() + geom_point() +
+  labs(title = "Validation RMSE vs k — High Missing",
+       x = "k (n_neighbors)", y = "Validation RMSE") +
+  theme_minimal() +
+  geom_vline(xintercept = best_k_high, linetype = "dashed", color = "red")
+
+# save
+ggsave(file.path(plots_dir, "high_elbow_plot.jpg"), p_high, width = 10, height = 8, dpi = 300)
+cat("Saved high missing elbow plot to", file.path(plots_dir, "high_elbow_plot.jpg"), "\n")
+
+print(p_high)
+
+```
+
+
+
+```{r high_train}
+
+missing_features_train_high <- features[sapply(train_high_missing[,features], function(x) any(is.na(x)))]
+
+set.seed(57) 
+
+# apply to training data - HIGH
+imp_train_high <- kNN(
+  data       = train_high_missing,
+  variable   = missing_features_train_high,
+  metric     = "gower", 
+  k          = best_k_high,
+  numFun     = mean,
+  catFun     = maxCat,
+  impNA      = TRUE,
+  methodStand = "range",
+  imp_var    = FALSE,
+  trace      = FALSE
+)
+
+mask_train_high <- is.na(train_high_missing[,features])
+
+pred_values_high <- c()
+truth_values_high <- c()
+
+for(row in 1:nrow(train_high_missing)) {
+  for(col in 1:length(features)) {
+    if(is.na(train_high_missing[row, features[col]])) {
+      pred_val <- if(is.factor(imp_train_high[[features[col]]])) {
+        as.numeric(as.character(imp_train_high[row, features[col]]))
+      } else {
+        as.numeric(imp_train_high[row, features[col]])
+      }
+      
+      truth_val <- if(is.factor(train_complete[[features[col]]])) {
+        as.numeric(as.character(train_complete[row, features[col]]))
+      } else {
+        as.numeric(train_complete[row, features[col]])
+      }
+      
+      pred_values_high <- c(pred_values_high, pred_val)
+      truth_values_high <- c(truth_values_high, truth_val)
+    }
+  }
+}
+
+train_rmse_high <- rmse(truth_values_high, pred_values_high)
+train_mae_high <- mae(truth_values_high, pred_values_high)
+
+cat("High train RMSE =", round(train_rmse_high,4), ", MAE =", round(train_mae_high,4), "\n")
+```
+
+
+
+
+```{r high test}
+
+missing_features_test_high <- features[sapply(test_high_missing[,features], function(x) any(is.na(x)))]
+
+set.seed(57)
+
+combined_test_high <- rbind(train_high_missing[,features], test_high_missing[,features])
+imp_test_comb_high <- kNN(
+  data        = combined_test_high,
+  variable    = missing_features_test_high,
+  metric      = "gower", 
+  k           = best_k_high,  
+  numFun      = mean,
+  catFun      = maxCat,
+  impNA       = TRUE,
+  methodStand = "range",
+  imp_var     = FALSE,
+  trace       = FALSE
+)
+
+n_train_high <- nrow(train_high_missing)
+imp_test_high <- imp_test_comb_high[(n_train_high+1):nrow(imp_test_comb_high), ]
+imp_test_high$target <- test_high_missing$target
+
+mask_test_high <- is.na(test_high_missing[,features])
+
+pred_values_test_high <- c()
+truth_values_test_high <- c()
+
+for(row in 1:nrow(test_high_missing)) {
+  for(col in 1:length(features)) {
+    if(is.na(test_high_missing[row, features[col]])) {
+      pred_val <- if(is.factor(imp_test_high[[features[col]]])) {
+        as.numeric(as.character(imp_test_high[row, features[col]]))
+      } else {
+        as.numeric(imp_test_high[row, features[col]])
+      }
+      
+      truth_val <- if(is.factor(test_complete[[features[col]]])) {
+        as.numeric(as.character(test_complete[row, features[col]]))
+      } else {
+        as.numeric(test_complete[row, features[col]])
+      }
+      
+      pred_values_test_high <- c(pred_values_test_high, pred_val)
+      truth_values_test_high <- c(truth_values_test_high, truth_val)
+    }
+  }
+}
+
+test_rmse_high <- rmse(truth_values_test_high, pred_values_test_high)
+test_mae_high <- mae(truth_values_test_high, pred_values_test_high)
+
+cat("High test RMSE =", round(test_rmse_high,4), ", MAE =", round(test_mae_high,4), "\n")
+```
+
+
+
+
+
+```{r save_imputed_data}
+# save imputed datasets
+write.csv(imp_train_low, file.path(diagnostics_dir, "train_low_KNN_imputed.csv"), row.names = FALSE)
+write.csv(imp_test_low, file.path(diagnostics_dir, "test_low_KNN_imputed.csv"), row.names = FALSE)
+write.csv(imp_train_high, file.path(diagnostics_dir, "train_high_KNN_imputed.csv"), row.names = FALSE)
+write.csv(imp_test_high, file.path(diagnostics_dir, "test_high_KNN_imputed.csv"), row.names = FALSE)
+
+cat("Saved imputed datasets to", diagnostics_dir, "\n")
+
+```
+

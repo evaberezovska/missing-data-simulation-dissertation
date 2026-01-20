@@ -1,0 +1,843 @@
+---
+title: "mice"
+author: '230031900'
+date: "2025-07-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r load_libraries_data, message=FALSE, warning=FALSE}
+
+library(mice)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(VIM)
+library(lattice)
+library(gridExtra)
+
+# create directories for diagnostics
+diagnostics_dir <- "results/mice_diagnostics"
+plots_dir <- file.path(diagnostics_dir, "plots")
+dir.create(diagnostics_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+# load data from iteration 1 for diagnostics
+iteration_dir <- "data/amputed/iteration_1"
+complete_dir <- "data/complete/iteration_1"
+
+train_low <- read.csv(file.path(iteration_dir, "train_low.csv"))
+test_low <- read.csv(file.path(iteration_dir, "test_low.csv"))
+train_high <- read.csv(file.path(iteration_dir, "train_high.csv"))
+test_high <- read.csv(file.path(iteration_dir, "test_high.csv"))
+train_complete <- read.csv(file.path(complete_dir, "train_complete.csv"))
+test_complete <- read.csv(file.path(complete_dir, "test_complete.csv"))
+
+
+```
+
+
+
+```{r save_plots}
+# function to save plots
+save_plot <- function(plot_obj = NULL, filename, width = 10, height = 8, dpi = 300) {
+  if (!is.null(plot_obj) && "ggplot" %in% class(plot_obj)) {
+    ggsave(
+      file.path(plots_dir, paste0(filename, ".png")),
+      plot = plot_obj,
+      width = width,
+      height = height,
+      dpi = dpi
+    )
+    cat("Saved ggplot:", filename, "\n")
+  } 
+  # for lattice/base R plots
+  else if (is.null(plot_obj)) {
+    return(file.path(plots_dir, paste0(filename, ".png")))
+  }
+}
+```
+
+
+
+
+```{r function_dataprep}
+
+# function to prepare data, convert categorical variables to factors for mice
+prepare_data <- function(train_data, test_data) {
+  binary_cols <- c("cat_0_Yes", "cat_1_Yes", "cat_2_Yes", "cat_3_Yes", 
+                  "cat_4_Level_B", "cat_4_Level_C")
+  
+  for (col in binary_cols) {
+    if (col %in% names(train_data)) {
+      train_data[[col]] <- factor(train_data[[col]], levels = c(0, 1))
+      test_data[[col]] <- factor(test_data[[col]], levels = c(0, 1))
+    }
+  }
+  
+  return(list(train = train_data, test = test_data, binary_cols = binary_cols))
+}
+```
+
+
+
+```{r function_mice_init}
+
+# function to initialize MICE
+initialize_mice <- function(train_data, binary_cols) {
+  init <- mice(train_data, m = 5, maxit = 0)
+  method <- init$method
+  
+  # data types
+  continuous_vars <- paste0("cont_", 0:14)   
+  discrete_vars   <- paste0("disc_", 0:4)    
+  binary_cols     <- c("cat_0_Yes", "cat_1_Yes", "cat_2_Yes",
+                     "cat_3_Yes", "cat_4_Level_B", "cat_4_Level_C")
+  
+  
+  # assign methods for mice
+  method[continuous_vars] <- "norm"    # Bayesian LR for continuous
+  method[discrete_vars]   <- "pmm"     # predictive mean matching for discrete
+  method[binary_cols]     <- "logreg"  # logistic regression for categorical
+  method["target"] <- ""
+  
+  # prediction matrix for all rows and cols except for target and itself
+  pred <- matrix(1, ncol = ncol(train_data), nrow = ncol(train_data))
+  rownames(pred) <- colnames(train_data)
+  colnames(pred) <- colnames(train_data)
+  diag(pred) <- 0
+  pred["target",] <- 0
+  
+  return(list(method = method, pred = pred, continuous_vars = continuous_vars))
+}
+
+```
+
+
+
+
+```{r pooled_dataset}
+# function to create a pooled dataset from multiple imputations
+create_pooled_dataset <- function(mice_object) {
+  m <- mice_object$m
+  data <- mice_object$data  
+  
+  pooled_data <- data
+  
+  for (var in names(data)) {
+    miss_idx <- which(is.na(data[[var]]))
+    if (length(miss_idx) == 0) next
+    
+    # for numeric variables
+    if (is.numeric(data[[var]])) {
+      all_values <- matrix(NA, nrow = length(miss_idx), ncol = m)
+      for (i in 1:m) {
+        imp_data <- complete(mice_object, i)
+        all_values[, i] <- imp_data[miss_idx, var]
+      }
+      pooled_values <- rowMeans(all_values)
+      pooled_data[miss_idx, var] <- pooled_values
+    }
+    
+    # for categorical variables
+    else if (is.factor(data[[var]])) {
+      for (j in seq_along(miss_idx)) {
+        idx <- miss_idx[j]
+        categories <- character(m)
+        for (i in 1:m) {
+          imp_data <- complete(mice_object, i)
+          categories[i] <- as.character(imp_data[idx, var])
+        }
+        most_common <- names(sort(table(categories), decreasing=TRUE))[1]
+        pooled_data[idx, var] <- factor(most_common, levels=levels(data[[var]]))
+      }
+    }
+  }
+  
+  return(pooled_data)
+}
+```
+
+
+
+
+
+```{r function_densityplot_for_m}
+
+# function to create density plot for different m values
+density_plot <- function(train_data, train_complete, method, pred, 
+                               m_values = c(20, 30, 40), 
+                               n_simulations = 20,
+                               maxit = 10,
+                               target_var = "cont_3",
+                               title_prefix = "") {
+  
+  set.seed(57)
+  density_data <- data.frame(
+    m = numeric(),
+    simulation = numeric(),
+    imputation = numeric(),
+    rmse = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  missing_idx <- which(is.na(train_data[[target_var]]))
+  true_values <- train_complete[[target_var]][missing_idx]
+  
+  for (m in m_values) {
+    cat("Processing m =", m, "\n")
+    
+    for (sim in 1:n_simulations) {
+      imp <- mice(train_data, m = m, maxit = maxit,
+                 method = method, predictorMatrix = pred,
+                 printFlag = FALSE, seed = 571 + sim)
+      
+      for (i in 1:m) {
+        imputed_data <- complete(imp, i)
+        imputed_values <- imputed_data[missing_idx, target_var]
+        rmse_value <- sqrt(mean((imputed_values - true_values)^2))
+        
+        density_data <- rbind(density_data, data.frame(
+          m = m,
+          simulation = sim,
+          imputation = i,
+          rmse = rmse_value
+        ))
+      }
+    }
+  }
+  
+  density_data$m_label <- factor(paste("m =", density_data$m), 
+                                levels = paste("m =", m_values))
+  
+  p <- ggplot(density_data, aes(x = rmse, color = factor(simulation))) +
+    geom_density() +
+    facet_wrap(~ m_label, nrow = 1) +
+    theme_minimal(base_size = 14) +
+    labs(title = paste0(title_prefix, " RMSE density plot for different m"),
+         subtitle = paste("Variable:", target_var),
+         x = "RMSE", y = "Density") +
+    theme(legend.position = "none",
+          panel.background = element_rect(fill = "white", color = NA),
+          plot.background = element_rect(fill = "white", color = NA),
+          panel.grid.major = element_line(color = "grey90"),
+          panel.grid.minor = element_line(color = "grey95"))
+  
+  filename <- paste0(gsub(" ", "_", title_prefix), "density_m_values")
+
+  ggsave(
+    file.path(plots_dir, paste0(filename, ".png")),
+    plot = p,
+    width = 10, 
+    height = 8,
+    dpi = 300,
+    bg = "white"  
+  )
+
+    print(p)
+  return(density_data)
+}
+
+```
+
+
+
+
+```{r function_run_mice}
+# function to run MICE with pooled datasets
+run_mice_imputation <- function(train_data, test_data, train_complete, test_complete,
+                              method, pred, 
+                              m = 30, maxit = 20,
+                              prefix = "") {
+  
+  # Run MICE on train data
+  set.seed(571)
+  imp_train <- mice(train_data, m = m, maxit = maxit,
+                   method = method, predictorMatrix = pred,
+                   printFlag = FALSE)
+  
+  # create pooled train dataset
+  train_pooled <- create_pooled_dataset(imp_train)
+  
+  # calculate errors for pooled train dataset
+  train_errors <- calculate_errors(
+    train_data, train_pooled, train_complete, 
+    paste0(prefix, " Train Pooled")
+  )
+  
+  # run MICE on test data
+  set.seed(572)
+  imp_test <- mice(test_data, m = m, maxit = maxit,
+                  method = method, predictorMatrix = pred,
+                  printFlag = FALSE)
+  
+  # Create pooled test dataset
+  test_pooled <- create_pooled_dataset(imp_test)
+  
+  # Calculate errors for pooled test dataset
+  test_errors <- calculate_errors(
+    test_data, test_pooled, test_complete,
+    paste0(prefix, " Test Pooled")
+  )
+  
+  return(list(
+    imp_train = imp_train,  # Keep for diagnostics
+    imp_test = imp_test,    # Keep for diagnostics
+    train_pooled = train_pooled,
+    test_pooled = test_pooled,
+    train_errors = train_errors,
+    test_errors = test_errors
+  ))
+}
+
+# Error calculation function for pooled data
+calculate_errors <- function(original_data, pooled_data, complete_data, prefix = "") {
+  overall_rmse <- 0
+  overall_mae <- 0
+  total_missing <- 0
+  
+  for (var in names(original_data)) {
+    if (var == "target") next
+    
+    missing_idx <- which(is.na(original_data[[var]]))
+    n_missing <- length(missing_idx)
+    
+    if (n_missing == 0) next
+    
+    true_vals <- complete_data[missing_idx, var]
+    imp_vals <- pooled_data[missing_idx, var]
+    
+    if (is.factor(true_vals) || is.factor(imp_vals)) {
+      true_vals <- as.numeric(as.character(true_vals))
+      imp_vals <- as.numeric(as.character(imp_vals))
+    }
+    
+    overall_rmse <- overall_rmse + sum((true_vals - imp_vals)^2)
+    overall_mae <- overall_mae + sum(abs(true_vals - imp_vals))
+    total_missing <- total_missing + n_missing
+  }
+  
+  if (total_missing > 0) {
+    overall_rmse <- sqrt(overall_rmse / total_missing)
+    overall_mae <- overall_mae / total_missing
+  } else {
+    overall_rmse <- NA
+    overall_mae <- NA
+  }
+  
+  cat(prefix, "RMSE:", round(overall_rmse, 4), "\n")
+  cat(prefix, "MAE:", round(overall_mae, 4), "\n")
+  
+  return(list(rmse = overall_rmse, mae = overall_mae))
+}
+
+```
+
+
+
+
+
+```{r function_save_data}
+# Updated save function for pooled data
+save_imputed_data <- function(train_pooled, test_pooled, prefix = "") {
+  dir_path <- diagnostics_dir
+  
+  train_file <- paste0(dir_path, "/train_", prefix, "_pooled_mice.csv")
+  test_file <- paste0(dir_path, "/test_", prefix, "_pooled_mice.csv")
+  
+  write.csv(train_pooled, train_file, row.names = FALSE)
+  write.csv(test_pooled, test_file, row.names = FALSE)
+  
+  cat("Saved pooled imputed data to:", dir_path, "\n")
+}
+```
+
+
+/////////////////////////////////// LOW DATASET ////////////////////////////////////////
+
+
+```{r start_mice_low}
+# prepare data
+low_data <- prepare_data(train_low, test_low)
+train_low <- low_data$train
+test_low <- low_data$test
+binary_cols <- low_data$binary_cols
+
+# initialize MICE
+low_mice <- initialize_mice(train_low, binary_cols)
+method_low <- low_mice$method
+pred_low <- low_mice$pred
+continuous_vars <- low_mice$continuous_vars
+
+```
+
+
+
+```{r convergence_plot_low, fig.width=12, fig.height=10}
+# trace plots for low missing data to find maxit
+imp_check <- mice(train_low, m = 30, maxit = 20, method = method_low, 
+                 predictorMatrix = pred_low, printFlag = FALSE)
+
+# find variables with missing data
+missing_vars <- colSums(is.na(train_low)) > 0
+num_missing_vars <- sum(missing_vars)
+cat("Low missing data: Found", num_missing_vars, "variables with missing values\n")
+
+# save 
+pdf_file <- file.path(plots_dir, "low_convergence_trace.pdf")
+pdf(pdf_file, width = 10, height = 8)
+plot(imp_check)  
+dev.off()
+cat("Saved all convergence trace plots for low missing data to PDF\n")
+
+plot(imp_check)
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r density_for_m_low, fig.width=10, fig.height=8}
+# density plot for m values low
+density_low <- density_plot(
+  train_low, train_complete, method_low, pred_low,
+  m_values = c(20, 30, 40),
+  n_simulations = 20,
+  title_prefix = "Low Missing -"
+)
+
+```
+
+
+
+```{r run_mice_low}
+# run MICE imputation with chosen m and maxit value
+low_results <- run_mice_imputation(
+  train_low, test_low, train_complete, test_complete,
+  method_low, pred_low,
+  m = 30, maxit = 20,
+  prefix = "Low"
+)
+
+# extract mice objects for low data
+imp_train_low <- low_results$imp_train
+imp_test_low <- low_results$imp_test
+train_pooled_low <- low_results$train_pooled
+test_pooled_low <- low_results$test_pooled
+
+```
+
+
+
+
+```{r define_num_missing_low, echo=TRUE}
+# define numerical variables with missing values
+numerical_vars <- c(paste0("cont_", 0:14), paste0("disc_", 0:4))
+num_missing <- names(which(colSums(is.na(train_low)) > 0 & 
+                         names(train_low) %in% numerical_vars))
+
+```
+
+
+
+
+```{r stripplots_combined_low, fig.width=12, fig.height=10}
+# save
+pdf_file <- file.path(plots_dir, "low_all_stripplots.pdf")
+pdf(pdf_file, width = 12, height = 10)
+
+for (var in num_missing) {
+  strip_plot <- stripplot(imp_train_low,  
+                 as.formula(paste0(var, "~.imp")), 
+                 pch = 20, 
+                 cex = 1.0,
+                 jitter.data = TRUE,
+                 factor = 2,
+                 col = c("darkturquoise", "deeppink3"),
+                 main = paste0("Stripplot for ", var),
+                 xlab = "Imputation number")
+  
+  print(strip_plot) 
+}
+dev.off()
+cat("Saved all stripplots for low missing data to PDF\n")
+
+# display in notebook
+for (var in num_missing) {
+  print(stripplot(imp_train_low,  
+                as.formula(paste0(var, "~.imp")), 
+                pch = 20, 
+                cex = 1.0,
+                jitter.data = TRUE,
+                factor = 2,
+                col = c("darkturquoise", "deeppink3"),
+                main = paste0("Stripplot for ", var),
+                xlab = "Imputation number"))
+}
+
+```
+
+
+```{r find_cat_missing_low, echo=FALSE}
+# find categorical variables with missing values
+cat_missing <- names(which(colSums(is.na(train_low)) > 0 & 
+                         names(train_low) %in% binary_cols))
+```
+
+
+
+
+
+```{r densityplots_low, fig.width=12, fig.height=10}
+
+# save 
+pdf_file <- file.path(plots_dir, "low_all_densityplots.pdf")
+pdf(pdf_file, width = 12, height = 10)
+
+for (var in num_missing) {
+  dens_plot <- densityplot(imp_train_low,  
+                   as.formula(paste0("~", var)),
+                   plot.points = FALSE,
+                   ref = TRUE,  
+                   main = paste0("Density plot for ", var),
+                   xlab = "Value")
+  
+  print(dens_plot) 
+}
+dev.off()
+cat("Saved all density plots for low missing data to PDF\n")
+
+# display in notebook
+for (var in num_missing) {
+  print(densityplot(imp_train_low,  
+                  as.formula(paste0("~", var)),
+                  plot.points = FALSE,
+                  ref = TRUE,  
+                  main = paste0("Density plot for ", var),
+                  xlab = "Value"))
+}
+```
+
+
+
+```{r propotion_plot_categorical_low, fig.width=10, fig.height=6}
+
+# proportion plots for categorical variables
+for (var in cat_missing) {
+  obs <- imp_train_low$data[[var]][!is.na(imp_train_low$data[[var]])]
+  obs_table <- table(obs)
+  obs_prop <- prop.table(obs_table)
+  obs_df <- data.frame(
+    value = names(obs_prop),
+    proportion = as.numeric(obs_prop),
+    type = "Observed"
+  )
+  
+
+  imp_props <- list()
+  for (i in 1:imp_train_low$m) {
+    imp_data <- complete(imp_train_low, i)
+    miss_idx <- is.na(imp_train_low$data[[var]])
+    imp_vals <- imp_data[[var]][miss_idx]
+    if (length(imp_vals) > 0) {
+      imp_table <- table(imp_vals)
+      imp_prop <- prop.table(imp_table)
+      imp_df <- data.frame(
+        value = names(imp_prop),
+        proportion = as.numeric(imp_prop),
+        type = paste("Imputation", i)
+      )
+      imp_props[[i]] <- imp_df
+    }
+  }
+  
+  # combine all imputations
+  all_imp_df <- do.call(rbind, imp_props)
+  
+  # average across all imputations
+  avg_imp <- aggregate(proportion ~ value, data = all_imp_df, FUN = mean)
+  avg_imp$type <- "Average Imputation"
+  
+  final_df <- rbind(obs_df, avg_imp)
+  
+  # plot
+  p <- ggplot(final_df, aes(x = value, y = proportion, fill = type)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = paste("Proportion of", var),
+         x = "Value", y = "Proportion") +
+    theme_minimal() +
+    ylim(0, 1) +
+    scale_fill_manual(values = c("Observed" = "darkturquoise", "Average Imputation" = "deeppink3"))
+  
+  save_plot(p, paste0("low_proportion_", var))
+  
+  print(p)
+}
+
+```
+
+
+
+
+```{r save_data_low}
+
+save_imputed_data(
+  train_pooled_low, 
+  test_pooled_low, 
+  "low"
+)
+```
+
+
+ /////////////////////////////////// HIGH DATASET ////////////////////////////////////////
+
+
+```{r start_mice_high}
+# prepare data
+high_data <- prepare_data(train_high, test_high)
+train_high <- high_data$train
+test_high <- high_data$test
+binary_cols <- high_data$binary_cols
+
+# initialize MICE
+high_mice <- initialize_mice(train_high, binary_cols)
+method_high <- high_mice$method
+pred_high <- high_mice$pred
+continuous_vars <- high_mice$continuous_vars
+```
+
+
+
+```{r convergence_plot_high, fig.width=12, fig.height=10}
+# trace plots for high missing data to find maxit
+imp_check <- mice(train_high, m = 30, maxit = 20, method = method_high, 
+                 predictorMatrix = pred_high, printFlag = FALSE)
+
+# find variables with missing data
+missing_vars <- colSums(is.na(train_high)) > 0
+num_missing_vars <- sum(missing_vars)
+cat("High missing data: Found", num_missing_vars, "variables with missing values\n")
+
+# save
+pdf_file <- file.path(plots_dir, "high_convergence_trace.pdf")
+pdf(pdf_file, width = 10, height = 8)
+plot(imp_check)  
+dev.off()
+cat("Saved all convergence trace plots for high missing data to PDF\n")
+
+
+plot(imp_check)
+```
+
+
+
+
+```{r density_for_m_high, fig.width=10, fig.height=8}
+# density plot for m values high
+density_high <- density_plot(
+  train_high, train_complete, method_high, pred_high,
+  m_values = c(20, 30, 40),  
+  n_simulations = 20,
+  title_prefix = "High Missing -"
+)
+```
+
+
+
+
+```{r run_mice_high}
+# run MICE imputation with chosen m and maxit value
+high_results <- run_mice_imputation(
+  train_high, test_high, train_complete, test_complete,
+  method_high, pred_high,
+  m = 30, maxit = 20,
+  prefix = "High"
+)
+
+# extract mice objects for low data
+imp_train_high <- high_results$imp_train
+imp_test_high <- high_results$imp_test
+train_pooled_high <- high_results$train_pooled
+test_pooled_high <- high_results$test_pooled
+
+
+```
+
+
+
+
+
+```{r define_num_missing_high, echo=TRUE}
+# define numerical variables with missing values
+numerical_vars <- c(paste0("cont_", 0:14), paste0("disc_", 0:4))
+num_missing <- names(which(colSums(is.na(train_high)) > 0 & 
+                         names(train_high) %in% numerical_vars))
+
+```
+
+
+
+
+
+
+```{r stripplots_combined_high, fig.width=12, fig.height=10}
+# save
+pdf_file <- file.path(plots_dir, "high_all_stripplots.pdf")
+pdf(pdf_file, width = 12, height = 10)
+
+for (var in num_missing) {
+  strip_plot <- stripplot(imp_train_high,  
+                 as.formula(paste0(var, "~.imp")), 
+                 pch = 20, 
+                 cex = 1.0,
+                 jitter.data = TRUE,
+                 factor = 2,
+                 col = c("darkturquoise", "deeppink3"),
+                 main = paste0("Stripplot for ", var),
+                 xlab = "Imputation number")
+  
+  print(strip_plot) 
+}
+dev.off()
+cat("Saved all stripplots for high missing data to PDF\n")
+
+# display in notebook
+for (var in num_missing) {
+  print(stripplot(imp_train_high,  
+                as.formula(paste0(var, "~.imp")), 
+                pch = 20, 
+                cex = 1.0,
+                jitter.data = TRUE,
+                factor = 2,
+                col = c("darkturquoise", "deeppink3"),
+                main = paste0("Stripplot for ", var),
+                xlab = "Imputation number"))
+}
+
+```
+
+```
+
+
+```{r find_cat_missing_high, echo=FALSE}
+
+# Find categorical variables with missing
+ cat_missing <- names(which(colSums(is.na(train_high)) > 0 & 
+                         names(train_high) %in% binary_cols))
+cat("Found", length(cat_missing), "categorical variables with missing values\n")
+
+```
+
+
+
+
+```{r densityplots_high, fig.width=12, fig.height=10}
+
+# save
+pdf_file <- file.path(plots_dir, "high_all_densityplots.pdf")
+pdf(pdf_file, width = 12, height = 10)
+
+for (var in num_missing) {
+  dens_plot <- densityplot(imp_train_high,  
+                   as.formula(paste0("~", var)),
+                   plot.points = FALSE,
+                   ref = TRUE,  
+                   main = paste0("Density plot for ", var),
+                   xlab = "Value")
+  
+  print(dens_plot) # This prints to the PDF
+}
+dev.off()
+cat("Saved all density plots for high missing data to PDF\n")
+
+# display in notebook
+for (var in num_missing) {
+  print(densityplot(imp_train_high,  
+                  as.formula(paste0("~", var)),
+                  plot.points = FALSE,
+                  ref = TRUE,  
+                  main = paste0("Density plot for ", var),
+                  xlab = "Value"))
+}
+```
+
+
+
+
+```{r propotion_plot_categorical_high, fig.width=10, fig.height=6}
+
+# proportion plots for categorical variables
+for (var in cat_missing) {
+  obs <- imp_train_high$data[[var]][!is.na(imp_train_high$data[[var]])]
+  obs_table <- table(obs)
+  obs_prop <- prop.table(obs_table)
+  obs_df <- data.frame(
+    value = names(obs_prop),
+    proportion = as.numeric(obs_prop),
+    type = "Observed"
+  )
+  
+  imp_props <- list()
+  for (i in 1:imp_train_high$m) {
+    imp_data <- complete(imp_train_high, i)
+    miss_idx <- is.na(imp_train_high$data[[var]])
+    imp_vals <- imp_data[[var]][miss_idx]
+    if (length(imp_vals) > 0) {
+      imp_table <- table(imp_vals)
+      imp_prop <- prop.table(imp_table)
+      imp_df <- data.frame(
+        value = names(imp_prop),
+        proportion = as.numeric(imp_prop),
+        type = paste("Imputation", i)
+      )
+      imp_props[[i]] <- imp_df
+    }
+  }
+  
+  # combine all imputations
+  all_imp_df <- do.call(rbind, imp_props)
+  
+  # average across all imputations
+  avg_imp <- aggregate(proportion ~ value, data = all_imp_df, FUN = mean)
+  avg_imp$type <- "Average Imputation"
+  
+  final_df <- rbind(obs_df, avg_imp)
+  
+  # plot
+  p <- ggplot(final_df, aes(x = value, y = proportion, fill = type)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = paste("Proportion of", var),
+         x = "Value", y = "Proportion") +
+    theme_minimal() +
+    ylim(0, 1) +
+    scale_fill_manual(values = c("Observed" = "darkturquoise", "Average Imputation" = "deeppink3"))
+  
+  save_plot(p, paste0("high_proportion_", var))
+  
+  
+  print(p)
+}
+```
+
+
+
+
+```{r save_data_high}
+save_imputed_data(
+  train_pooled_high, 
+  test_pooled_high, 
+  "high"
+)
+```
+
